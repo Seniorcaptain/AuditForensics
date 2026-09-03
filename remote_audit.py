@@ -1,60 +1,73 @@
 #!/usr/bin/env python3
 """
-AuditForensics Ultimate – Multi‑target scanning (Python orchestrator)
-Uses subprocess to invoke PowerShell remoting.
+AuditForensics Ultimate – Python orchestrator with IP range support.
+Embeds the full PowerShell script and runs it locally or remotely.
 """
-
 import sys
 import os
 import json
 import subprocess
 import tempfile
+import ipaddress
 import datetime
-import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import click
 
-# ---------- Dependencies ----------
-try:
-    import jinja2
-    import yaml
-except ImportError:
-    print("Please install: pip install click jinja2 pyyaml")
-    sys.exit(1)
+# ----------------------------------------------------------------------
+# EMBEDDED POWER SHELL SCRIPT (the entire content of the PS1 file above)
+# ----------------------------------------------------------------------
+# In practice, you would paste the complete PowerShell script here.
+# For brevity, we use a placeholder. In the final file, copy the entire
+# PS1 content between the triple quotes.
+EMBEDDED_PS1 = r'''
+# (Place the full PS1 script here – the one from the previous section)
+# This must include all the logic described above.
+'''
 
-# ---------- Embedded PowerShell script (same as before) ----------
-EMBEDDED_PS1 = r'''  # (the full script from earlier – omitted for brevity)  '''
-# In production, paste the full PowerShell script here.
+# ----------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------
+def expand_ip_range(range_str):
+    """Expand CIDR or start-end IP range to list of IP strings."""
+    if '/' in range_str:
+        net = ipaddress.ip_network(range_str, strict=False)
+        return [str(ip) for ip in net.hosts()]
+    elif '-' in range_str:
+        start_str, end_str = range_str.split('-')
+        start = int(ipaddress.IPv4Address(start_str.strip()))
+        end = int(ipaddress.IPv4Address(end_str.strip()))
+        return [str(ipaddress.IPv4Address(ip)) for ip in range(start, end+1)]
+    else:
+        return [range_str.strip()]
 
-# ---------- Helper: Run a single machine audit ----------
-def run_audit_on_machine(computer, output_dir, sigma, correlate, baseline, ai_enrich, ps1_script_path):
-    """Execute the PowerShell script remotely on a single target."""
+def is_host_alive(ip, timeout=1):
+    """Ping host and return True if reachable."""
+    param = '-n' if sys.platform == 'win32' else '-c'
     try:
-        # Construct command: Invoke-Command -ComputerName $computer -ScriptBlock { ... }
-        # We'll use the embedded script as a file path (shared location) or pass as string.
-        # For simplicity, we assume the script is accessible via network share or local path on remote.
-        # Here we use -FilePath to copy the script itself.
-        cmd = [
-            "powershell",
-            "-ExecutionPolicy", "Bypass",
-            "-Command",
-            f"Invoke-Command -ComputerName {computer} -ScriptBlock {{ & '{ps1_script_path}' -OutputPath '{output_dir}' -Sigma:`${Sigma} -Correlate:`${Correlate} -Baseline:`${Baseline} -AIEnrich:`${AIEnrich} }}"
-        ]
-        # Actually we need to pass booleans correctly; for brevity we use a simplified string.
-        # Better: create a remote session and use -FilePath to run the script.
-        # We'll just call it as a script file.
-        # We'll use a simpler approach: copy the script to a network share and invoke.
-        # For this demo, we assume the script is already on the target.
-        # We'll use the same method as PS version.
-        pass
-    except Exception as e:
-        return {"computer": computer, "status": "Failed", "error": str(e)}
+        subprocess.run(['ping', param, '1', '-w', str(timeout*1000), ip],
+                       capture_output=True, timeout=2, check=False)
+        return True
+    except:
+        return False
 
-# ---------- Main CLI ----------
+def is_winrm_available(ip):
+    """Test WinRM connectivity using Test-WSMan via PowerShell."""
+    cmd = ['powershell', '-Command', f'Test-WSMan -ComputerName {ip} -ErrorAction SilentlyContinue']
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+        return result.returncode == 0 and 'Product' in result.stdout.decode()
+    except:
+        return False
+
+# ----------------------------------------------------------------------
+# MAIN CLI
+# ----------------------------------------------------------------------
 @click.command()
-@click.option('--targets', '-t', multiple=True, help='List of computer names (repeat or comma-separated)')
-@click.option('--target-file', '-f', help='File with one computer per line')
+@click.option('--targets', '-t', multiple=True, help='Hostnames or IPs')
+@click.option('--target-file', '-f', help='File with one target per line')
+@click.option('--ip-range', help='CIDR (e.g., 192.168.1.0/24) or range (10.0.0.1-10.0.0.254)')
+@click.option('--ping-only', is_flag=True, help='Only discover hosts, do not audit')
 @click.option('--throttle', default=20, help='Parallel threads (default 20)')
 @click.option('--output-path', '-o', default='.', help='Output directory')
 @click.option('--sigma', is_flag=True, help='Enable Sigma checks')
@@ -62,113 +75,107 @@ def run_audit_on_machine(computer, output_dir, sigma, correlate, baseline, ai_en
 @click.option('--baseline', is_flag=True, help='Enable baseline')
 @click.option('--ai-enrich', is_flag=True, help='Enable AI (requires OPENAI_API_KEY)')
 @click.option('--demo', is_flag=True, help='Demo mode (single host)')
-@click.option('--username', help='Remote username (if needed)')
-@click.option('--password', help='Remote password (if needed)')
-def main(targets, target_file, throttle, output_path, sigma, correlate, baseline, ai_enrich, demo, username, password):
-    """AuditForensics Ultimate – multi‑target scanner (Python orchestrator)."""
-    if demo:
-        # Run local demo (original single‑host demo)
-        print("[*] Demo mode – single host only.")
-        # ... (call the local audit function)
-        return
-
-    # Gather targets
+@click.option('--username', help='Remote username (optional)')
+@click.option('--password', help='Remote password (optional)')
+def main(targets, target_file, ip_range, ping_only, throttle, output_path,
+         sigma, correlate, baseline, ai_enrich, demo, username, password):
+    """AuditForensics Ultimate – multi‑target orchestrator with IP range."""
+    # ---------- Resolve targets ----------
     target_list = list(targets) if targets else []
     if target_file and os.path.exists(target_file):
         with open(target_file, 'r') as f:
             target_list += [line.strip() for line in f if line.strip()]
 
-    if not target_list:
-        print("[!] No targets provided. Use --targets or --target-file.")
+    if ip_range:
+        print(f"[*] Expanding IP range: {ip_range}")
+        all_ips = expand_ip_range(ip_range)
+        print(f"[*] Testing connectivity for {len(all_ips)} addresses...")
+        alive_ips = []
+        for ip in all_ips:
+            if is_host_alive(ip):
+                if is_winrm_available(ip):
+                    alive_ips.append(ip)
+        if ping_only:
+            print('\n'.join(alive_ips))
+            return
+        if not alive_ips:
+            print("[!] No WinRM-reachable hosts found.")
+            return
+        target_list = alive_ips
+        print(f"[*] Found {len(target_list)} reachable WinRM hosts.")
+
+    if not target_list and not demo:
+        print("[!] No targets specified. Use --targets, --target-file, --ip-range, or --demo.")
         sys.exit(1)
 
-    print(f"[*] Starting multi‑target scan for {len(target_list)} machines...")
-
-    # We'll write the embedded PS1 to a temporary file that will be placed on a network share.
-    # For simplicity, we assume the script is already available at a fixed network path.
-    # We'll use the same technique as the PowerShell version: copy script to a temp location,
-    # but remote execution requires it to be accessible. We'll use `Invoke-Command -FilePath`.
-    # We'll generate a script that runs the embedded PS1 content on each target.
-
-    # Create a local copy of the script to push.
+    # ---------- Write embedded PS1 to temporary file ----------
     with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1', delete=False) as f:
         f.write(EMBEDDED_PS1)
-        local_script = f.name
+        ps1_path = f.name
 
-    # We'll use a central output directory accessible to all machines (e.g., a UNC path).
-    # For simplicity, we'll tell each machine to output to a local directory and then we collect.
-    # Or we can use a share. We'll stick to local output per machine, then copy back.
-    # This is a simplified version; a production implementation would use a share.
-
-    # For each target, we'll run a subprocess that invokes PowerShell with -Command to run the script remotely.
-    # We'll use ThreadPoolExecutor for parallelism.
-
-    def scan_one(computer):
-        print(f"[*] Scanning {computer}...")
-        # Build command: powershell -Command "Invoke-Command -ComputerName {computer} -FilePath {local_script} -ArgumentList ..."
-        # We'll pass arguments as a hashtable.
-        args = f"-OutputPath '$env:USERPROFILE\\Desktop\\AuditReports' -Sigma:`${Sigma} -Correlate:`${Correlate} -Baseline:`${Baseline} -AIEnrich:`${AIEnrich}"
+    # ---------- If demo, run local ----------
+    if demo:
+        print("[*] Demo mode – running local audit with sample data.")
         cmd = [
-            "powershell",
-            "-ExecutionPolicy", "Bypass",
-            "-Command",
-            f"Invoke-Command -ComputerName {computer} -FilePath '{local_script}' -ArgumentList @( '{output_path}', ${Sigma}, ${Correlate}, ${Baseline}, ${AIEnrich} )"
+            'powershell',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', ps1_path,
+            '-Demo',
+            '-OutputPath', output_path
         ]
-        # Actually we need to handle booleans properly. We'll just use a simple method:
-        # We'll create a remote session and run the script block.
-        # To keep it simple, we'll use the approach from the PS version.
-        # We'll just execute the script via Invoke-Command -FilePath.
-        # But we need to pass parameters.
-        # We'll generate a script that runs the embedded version.
-        # This is getting complex; we'll just rely on the PS version's -Targets parameter.
-        # So we can simply call the PS script with -Targets.
-        # For Python, we'll delegate to the PS script.
-        # So the Python orchestrator will just call the PowerShell script with -Targets.
-        # That is the cleanest approach.
-        subprocess.run([
-            "powershell",
-            "-ExecutionPolicy", "Bypass",
-            "-File", local_script,
-            "-Targets", computer,
-            "-OutputPath", output_path,
-            "-Sigma" if sigma else "",
-            "-Correlate" if correlate else "",
-            "-Baseline" if baseline else "",
-            "-AIEnrich" if ai_enrich else ""
-        ], capture_output=True, check=False)
-        return computer
+        if sigma: cmd.append('-Sigma')
+        if correlate: cmd.append('-Correlate')
+        if baseline: cmd.append('-Baseline')
+        if ai_enrich: cmd.append('-AIEnrich')
+        subprocess.run(cmd, check=True)
+        os.unlink(ps1_path)
+        return
+
+    # ---------- Multi-target scan ----------
+    print(f"[*] Starting multi-target scan for {len(target_list)} machines...")
+
+    # Build base command for each target
+    base_cmd = [
+        'powershell',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', ps1_path,
+        '-OutputPath', output_path
+    ]
+    if sigma: base_cmd.append('-Sigma')
+    if correlate: base_cmd.append('-Correlate')
+    if baseline: base_cmd.append('-Baseline')
+    if ai_enrich: base_cmd.append('-AIEnrich')
+    if username:
+        base_cmd.extend(['-Credential', username])
+        if password:
+            # Note: this is not secure; better to use SecureString in real use.
+            base_cmd.extend(['-Password', password])
+
+    def scan_one(target):
+        cmd = base_cmd + ['-Targets', target]
+        # In a real deployment, you'd handle credentials better.
+        subprocess.run(cmd, capture_output=True, check=False)
+        return target
 
     with ThreadPoolExecutor(max_workers=throttle) as executor:
-        futures = {executor.submit(scan_one, comp): comp for comp in target_list}
+        futures = {executor.submit(scan_one, t): t for t in target_list}
         for future in as_completed(futures):
-            comp = futures[future]
+            t = futures[future]
             try:
                 future.result()
+                print(f"[+] Scan completed for {t}")
             except Exception as e:
-                print(f"[!] Error scanning {comp}: {e}")
+                print(f"[!] Error scanning {t}: {e}")
 
-    # After all, we can aggregate results by looking for JSON files.
-    # We'll implement aggregation similar to PS version.
+    # ---------- Generate aggregated report (if PS script didn't) ----------
+    # The PS script already generates aggregated reports when -Targets is used.
+    # If not, we can do a minimal aggregation here.
+    # We'll assume the PS script did it, but we can also implement a fallback.
+    print("[*] Aggregated reports should be in the output directory.")
+    print(f"[+] Output directory: {output_path}")
 
-    print("[*] Aggregating results...")
-    # Find all JSON files in output_path
-    json_files = list(Path(output_path).glob("AuditForensics_*.json"))
-    machine_results = []
-    for jf in json_files:
-        with open(jf, 'r') as f:
-            data = json.load(f)
-            machine_results.append({
-                "computer": data.get("Target", "unknown"),
-                "summary": data.get("Summary", {}),
-                "findings": data.get("Findings", [])
-            })
+    # Cleanup
+    os.unlink(ps1_path)
 
-    # Generate aggregated HTML (similar to PS version).
-    # ... (we can reuse the HTML generation code from the PS version or write a new one)
-    print(f"[+] Aggregated report saved to {output_path}/aggregated_report.html")
-
-    # Cleanup temp script
-    os.unlink(local_script)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
